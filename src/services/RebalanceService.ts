@@ -6,7 +6,8 @@ import { TransactionManager } from "./TransactionsService";
 import { BotService } from "../bot";
 import config from "../utils/config";
 import { RebalanceOperation } from "../types";
-import { randomUUID } from 'node:crypto';
+import { randomUUID } from "node:crypto";
+import { getPrice } from "../utils/coinmarketcap";
 
 export class RebalanceService {
   private supabase: SupabaseClient<Database>;
@@ -47,14 +48,7 @@ export class RebalanceService {
         return;
       }
 
-      // Get token configuration
-      const tokenConfig = {
-        token_address: config.ethereumTokenAddress,
-        decimals: Number(config.tokenDecimals),
-        rebalance_threshold: Number(config.rebalanceThreshold),
-      };
-
-      // Check balances on both chains
+      // Check balances on both chains for the desired token
       const [ethereumBalance, mantleBalance] = await Promise.all([
         this.txManager.checkTokenBalance(
           config.ethereumTokenAddress as Address,
@@ -70,48 +64,58 @@ export class RebalanceService {
 
       // Format balances for comparison
       const parsedEthereumBalance = Number(
-        formatUnits(ethereumBalance, tokenConfig.decimals)
+        formatUnits(ethereumBalance, config.ethereumTokenDecimals)
       );
       const parsedMantleBalance = Number(
-        formatUnits(mantleBalance, tokenConfig.decimals)
+        formatUnits(mantleBalance, config.mantleTokenDecimals)
       );
 
       // Log current state
       await this.botService.sendInfo(
         `Current Balances:\n` +
-          `Ethereum Chain (${config.ethAddress}): ${parsedEthereumBalance} ETH\n` +
-          `Mantle Chain (${config.mantleAddress}): ${parsedMantleBalance} MNT\n` +
-          `Threshold: ${tokenConfig.rebalance_threshold} ${config.tokenSymbol}`
+          `Ethereum Chain (${config.ethAddress}): ${parsedEthereumBalance} ${config.ethereumTokenSymbol}\n` +
+          `Threshold: ${config.ethereumTokenThreshold} ${config.ethereumTokenSymbol}\n` +
+          `Mantle Chain (${config.mantleAddress}): ${parsedMantleBalance} ${config.mantleTokenSymbol}\n` +
+          `Threshold: ${config.mantleTokenThreshold} ${config.mantleTokenSymbol}`
       );
 
-      // Check if addresses have minimum required balance for gas
-      // 10% of threshold as minimum required balance
-      const minBalance = tokenConfig.rebalance_threshold * 0.1;
+      // check if both side have gas balance
+      const minBalance = 0.001;
+      const ethGasBalance = await this.txManager.checkTokenBalance(
+        "0x0000000000000000000000000000000000000000",
+        config.ethAddress as Address,
+        "ethereum"
+      );
+      const mantleGasBalance = await this.txManager.checkTokenBalance(
+        "0x0000000000000000000000000000000000000000",
+        config.mantleAddress as Address,
+        "mantle"
+      );
 
-      if (parsedEthereumBalance < minBalance) {
-        throw new Error(
-          `Insufficient balance on Ethereum address: ${parsedEthereumBalance} ${config.tokenSymbol}`
+      if (ethGasBalance < minBalance || mantleGasBalance < minBalance) {
+        await this.botService.sendError(
+          `Insufficient gas balance on address: 
+          Ethereum: ${ethGasBalance} ${config.ethereumTokenSymbol}
+          Mantle: ${mantleGasBalance} ${config.mantleTokenSymbol}`
         );
-      }
-
-      if (parsedMantleBalance < minBalance) {
         throw new Error(
-          `Insufficient balance on Mantle address: ${parsedMantleBalance} ${config.tokenSymbol}`
+          `Insufficient balance on address: 
+          Ethereum: ${ethGasBalance} ${config.ethereumTokenSymbol}
+          Mantle: ${mantleGasBalance} ${config.mantleTokenSymbol}`
         );
       }
 
       // Calculate required rebalancing
       const operation = await this.calculateRebalancing(
         parsedEthereumBalance,
-        parsedMantleBalance,
-        tokenConfig.rebalance_threshold,
-        tokenConfig
+        parsedMantleBalance
       );
 
       if (operation) {
         await this.executeRebalancing(operation);
       } else {
         logInfo("No rebalancing needed at this time");
+        await this.botService.sendInfo("No rebalancing needed at this time");
       }
     } catch (error: any) {
       logError("Error in rebalance process:", error);
@@ -123,57 +127,62 @@ export class RebalanceService {
 
   private async calculateRebalancing(
     ethereumBalance: number,
-    mantleBalance: number,
-    threshold: number,
-    tokenConfig: any
+    mantleBalance: number
   ): Promise<RebalanceOperation | null> {
-    const totalBalance = ethereumBalance + mantleBalance;
+    // calculate how much extra threshold we have on each side
+    // whichever has extra threshold, we will rebalance to the other side
 
-    // Calculate imbalance
-    const imbalance = Math.abs(ethereumBalance - mantleBalance);
+    // fetch the price of both tokens in usd, take the sum of balance / price
+    const ethereumPrice = await getPrice(
+      config.ethereumTokenAddress,
+      this.botService
+    );
+    const mantlePrice = await getPrice(
+      config.mantleTokenAddress,
+      this.botService
+    );
+    const ethereumBalanceUsd = ethereumBalance * ethereumPrice;
+    const mantleBalanceUsd = mantleBalance * mantlePrice;
 
-    // Only rebalance if imbalance is greater than threshold
-    if (imbalance <= threshold) {
+    // check which side has more threshold
+    const ethereumThresholdUsd = config.ethereumTokenThreshold * ethereumPrice;
+    const mantleThresholdUsd = config.mantleTokenThreshold * mantlePrice;
+    console.log("ethereumThresholdUsd", ethereumThresholdUsd);
+    console.log("mantleThresholdUsd", mantleThresholdUsd);
+    console.log("ethereumBalanceUsd", ethereumBalanceUsd);
+    console.log("mantleBalanceUsd", mantleBalanceUsd);
+    // if balance is greater than threshold, we don't need to rebalance
+    if (
+      ethereumBalanceUsd > ethereumThresholdUsd &&
+      mantleBalanceUsd > mantleThresholdUsd
+    ) {
       return null;
     }
 
+    // calculate imbalance
+    const totalBalanceUSD =
+      ethereumBalanceUsd +
+      mantleBalanceUsd -
+      ethereumThresholdUsd -
+      mantleThresholdUsd;
+    const imbalanceToMoveUSD = totalBalanceUSD / 2;
+    console.log("ethereumThresholdUsd", ethereumThresholdUsd);
+    console.log("mantleThresholdUsd", mantleThresholdUsd);
+    console.log("imbalanceToMoveUSD", imbalanceToMoveUSD);
+    // check which side has more threshold
     let direction: "MAINNET_TO_MANTLE" | "MANTLE_TO_MAINNET";
     let amountToMove: number;
 
-    // Min balance to maintain on both chains
-    const minRequiredBalance = threshold * 0.1;
-
-    // Determine direction and amount
-    if (ethereumBalance > mantleBalance) {
+    if (ethereumThresholdUsd > mantleThresholdUsd) {
       direction = "MAINNET_TO_MANTLE";
-      // Calculate the target balance after rebalancing
-      const targetMantleBalance = Math.min(
-        mantleBalance + imbalance * 0.5,
-        totalBalance * 0.5
-      );
-      amountToMove = Math.min(
-        targetMantleBalance - mantleBalance,
-        ethereumBalance - minRequiredBalance
-      );
+      amountToMove =
+        (imbalanceToMoveUSD * 10 ** config.ethereumTokenDecimals) /
+        ethereumPrice;
     } else {
       direction = "MANTLE_TO_MAINNET";
-      const targetEthBalance = Math.min(
-        ethereumBalance + imbalance * 0.5,
-        totalBalance * 0.5
-      );
-      amountToMove = Math.min(
-        targetEthBalance - ethereumBalance,
-        mantleBalance - minRequiredBalance
-      );
+      amountToMove =
+        (imbalanceToMoveUSD * 10 ** config.mantleTokenDecimals) / mantlePrice;
     }
-
-    // Ensure the amount to move is significant enough
-    if (amountToMove <= threshold * 0.1) {
-      return null;
-    }
-
-    // Round the amount to reasonable precision (6 decimal places)
-    amountToMove = Math.floor(amountToMove * 1e6) / 1e6;
 
     const operation = {
       id: randomUUID(),
@@ -181,11 +190,11 @@ export class RebalanceService {
         direction === "MAINNET_TO_MANTLE"
           ? config.ethereumTokenAddress
           : config.mantleTokenAddress,
-      token_decimals: tokenConfig.decimals,
-      amount_to_bridge: parseUnits(
-        amountToMove.toString(),
-        tokenConfig.decimals
-      ).toString(),
+      token_decimals:
+        direction === "MAINNET_TO_MANTLE"
+          ? config.ethereumTokenDecimals
+          : config.mantleTokenDecimals,
+      amount_to_bridge: amountToMove.toString(),
       direction,
       status: "PENDING" as const,
     };
@@ -207,7 +216,8 @@ export class RebalanceService {
         }\n` +
         `Current Ethereum Balance: ${ethereumBalance}\n` +
         `Current Mantle Balance: ${mantleBalance}\n` +
-        `Threshold: ${tokenConfig.rebalance_threshold}`
+        `Ethereum Threshold: ${ethereumThresholdUsd}\n` +
+        `Mantle Threshold: ${mantleThresholdUsd}`
     );
 
     return operation;
@@ -226,7 +236,7 @@ export class RebalanceService {
       // Execute the bridge transaction
       const txHash = await this.txManager.bridgeTokens({
         tokenAddress: operation.token_address as Address,
-        amount: BigInt(operation.amount_to_bridge),
+        amount: BigInt(parseInt(operation.amount_to_bridge, 10)),
         direction: operation.direction,
         config,
       });
@@ -251,8 +261,8 @@ export class RebalanceService {
       );
     } catch (error: any) {
       logError(
-        `Failed to execute rebalancing for operation ${operation.id}:`,
-        error
+        `Failed to execute rebalancing for operation ${operation.id}:`
+        // error
       );
       await this.botService.sendError(`Rebalancing failed: ${error.message}`);
 
@@ -268,7 +278,9 @@ export class RebalanceService {
 
   private async resumeOperation(operation: RebalanceOperation): Promise<void> {
     logInfo(`Resuming operation ${operation.id}`);
-    await this.botService.sendInfo(`Resuming previous operation ${operation.id}`);
+    await this.botService.sendInfo(
+      `Resuming previous operation ${operation.id}`
+    );
 
     if (operation.bridge_txhash) {
       // If we have a transaction hash, monitor it
@@ -299,7 +311,9 @@ export class RebalanceService {
         );
 
         if (status === "COMPLETED") {
-          await this.botService.sendInfo(`Bridge transaction ${txHash} completed`);
+          await this.botService.sendInfo(
+            `Bridge transaction ${txHash} completed`
+          );
           return;
         }
 
@@ -313,7 +327,7 @@ export class RebalanceService {
         await new Promise((resolve) => setTimeout(resolve, baseDelay + jitter));
         attempts++;
       } catch (error) {
-        logError(`Error monitoring transaction ${txHash}:`, error);
+        logError(`Error monitoring transaction ${txHash}:`);
         throw error;
       }
     }

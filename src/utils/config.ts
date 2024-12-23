@@ -2,7 +2,7 @@ import dotenv from "dotenv";
 import { logError } from "./logging";
 dotenv.config();
 
-interface Config {
+export interface Config {
   ethereumChainId: number;
   mantleChainId: number;
   ethereumRpcUrl: string;
@@ -10,7 +10,8 @@ interface Config {
   ethAddress: string;
   mantleAddress: string;
   privateKey: string;
-  rebalanceThreshold: number;
+  ethereumTokenThreshold: number;
+  mantleTokenThreshold: number;
   bridgeMode: "fast" | "secure";
   pollIntervalMs: number;
   bungeeApiKey: string;
@@ -20,9 +21,12 @@ interface Config {
   supabaseKey: string;
   ethereumTokenAddress: string;
   mantleTokenAddress: string;
-  tokenSymbol: string;
-  tokenDecimals: number;
+  ethereumTokenSymbol: string;
+  ethereumTokenDecimals: number;
+  mantleTokenSymbol: string;
+  mantleTokenDecimals: number;
   minBalancePercentage: number;
+  coinMarketCapApiKey: string;
 }
 
 function validateConfig(config: Partial<Config>): config is Config {
@@ -65,10 +69,10 @@ function validateConfig(config: Partial<Config>): config is Config {
 
   // Validate numerical values
   if (
-    typeof config.rebalanceThreshold === "undefined" ||
-    config.rebalanceThreshold <= 0
+    typeof config.ethereumTokenThreshold === "undefined" ||
+    config.ethereumTokenThreshold <= 0
   ) {
-    throw new Error("Rebalance threshold must be greater than 0");
+    throw new Error("Ethereum token threshold must be greater than 0");
   }
 
   if (
@@ -83,6 +87,10 @@ function validateConfig(config: Partial<Config>): config is Config {
   }
   if (!config.mantleTokenAddress?.startsWith("0x")) {
     throw new Error("Invalid Mantle token address");
+  }
+
+  if (!config.coinMarketCapApiKey) {
+    throw new Error("Missing CoinMarketCap API key");
   }
 
   return true;
@@ -103,7 +111,10 @@ const config: Partial<Config> = {
   privateKey: process.env.PRIVATE_KEY,
 
   // Rebalancing Configuration
-  rebalanceThreshold: parseFloat(process.env.REBALANCE_THRESHOLD || "0.0001"),
+  ethereumTokenThreshold: parseFloat(
+    process.env.ETHEREUM_TOKEN_THRESHOLD || "0.001"
+  ),
+  mantleTokenThreshold: parseFloat(process.env.MANTLE_TOKEN_THRESHOLD || "30"),
   bridgeMode: (process.env.BRIDGE_MODE as "fast" | "secure") || "fast",
   pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "60000", 10),
   minBalancePercentage: parseInt(
@@ -119,10 +130,15 @@ const config: Partial<Config> = {
   supabaseKey: process.env.SUPABASE_KEY,
 
   // Token Configuration
-  ethereumTokenAddress: "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",
-  mantleTokenAddress: "0xdeaddeaddeaddeaddeaddeaddeaddeaddead0000",
-  tokenSymbol: process.env.TOKEN_SYMBOL || "ETH",
-  tokenDecimals: parseInt(process.env.TOKEN_DECIMALS || "18", 10),
+  ethereumTokenAddress: process.env.ETHEREUM_TOKEN_ADDRESS,
+  mantleTokenAddress: process.env.MANTLE_TOKEN_ADDRESS,
+  ethereumTokenSymbol: process.env.ETHEREUM_TOKEN_SYMBOL,
+  ethereumTokenDecimals: parseInt(process.env.ETHEREUM_TOKEN_DECIMALS || "6", 10),
+  mantleTokenSymbol: process.env.MANTLE_TOKEN_SYMBOL,
+  mantleTokenDecimals: parseInt(process.env.MANTLE_TOKEN_DECIMALS || "6", 10),
+
+  // CoinMarketCap API Key
+  coinMarketCapApiKey: process.env.COINMARKETCAP_API_KEY,
 };
 
 try {

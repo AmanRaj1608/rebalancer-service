@@ -1,7 +1,6 @@
-### Rebalancer Service Architecture
+## Rebalancer Service Architecture
 
-A high-level implementation of rebalancer service which can rebalance assets between the ETH
-Mainnet and the Mantle Chain.
+A high-level implementation of a rebalancer service that automatically rebalances assets between ETH Mainnet and Mantle Chain using Socket/Bungee for bridging.
 
 ```mermaid
 flowchart TD
@@ -10,34 +9,39 @@ flowchart TD
     A -->|Trigger| D[Rebalancing Service]
 
     subgraph Rebalancing Service
-        D -->|Check Balances| X[Merge Assets into ETH if needed]
-        D -->|Analyze| E[Bridge Mechanism]
-        E -->|Small Amount| F[Symbiosis Bridge]
-        E -->|Large Amount| G[Bungee / Mantle Bridge]
-        X -->|Swap to ETH then Bridge| E
-        D -->|Calculate| H[Gas/Rate Calculator]
+        D -->|Calculate| E[Price Service]
+        E -->|Get USD Values| F[CoinMarketCap API]
+        D -->|Execute| G[Transaction Service]
+        G -->|Bridge| H[Socket/Bungee API]
     end
 
-    subgraph Notification System
-        D -->|Notify| I[Alert Service]
-        I -->|Send| J[Webhook/API Endpoint]
+    subgraph Transaction Flow
+        H -->|1. Get Quote| I[Socket Quote API]
+        I -->|2. Build Tx| J[Socket Build API]
+        J -->|3. Approve| K[Token Approval]
+        K -->|4. Bridge| L[Bridge Transaction]
+        L -->|5. Monitor| M[Bridge Status API]
     end
 
     subgraph State Management
-        K[Transaction State DB] <-->|Track| D
-        K -->|Monitor| L[Transfer Verification]
+        N[Supabase DB] <-->|Track| D
+        N -->|Store| O[Operation Status]
+        O -->|Monitor| M
     end
 
-    M[Logging Service] -.->|Record| A
-    M -.->|Record| D
-    M -.->|Record| L
+    subgraph Notification System
+        D -->|Alert| P[Telegram Bot]
+        P -->|Send| Q[Admin Chat]
+    end
 ```
 
 In this flow:
 
-- We first check if assets on Mantle must be swapped to ETH (or vice versa) before bridging.
-- The Rebalancing Service merges assets into ETH on whichever chain they're originally held, then performs bridging to the target chain.
-- Using the Max-Flow Min-Cut analogy, we can calculate the best path for rebalancing based on gas fees and rates.
+- Price based rebalancing: Using CMC API to calculate USD values for accurate rebalancing.
+- Multi Step Bridging: Supports direct token bridging any token→ETH→token paths.
+- Transaction Monitoring: Tracks bridge status and handles transaction failures
+- State Management: Uses Supabase to track operation status and resume interrupted operations
+- Admin Notifications: Telegram bot integration for monitoring and alerts
 
 ### Getting Started
 
@@ -51,15 +55,15 @@ npm install
 npm run dev
 ```
 
-Or use Docker to run the service:
-
+Or use Docker:
 ```bash
-docker build -t rebalance-bot .
-docker run -d --name rebalance-bot -p 3000:3000 rebalance-bot
+docker build -t rebalancer .
+docker run -d --name rebalancer --env-file .env rebalancer
 ```
 
 ### Future Enhancements for Production
 
-1. Use NestJS: better structuring of controllers, services.
+1. Smart Contract: Add support for smart contracts(safe) for rebalancing.
 2. Fallback solutions: Implement (Symbiosis Bridge, Mantle Bridge, etc.) without relying solely on Bungee.
 3. WebSockets: For tg bot instead of long-polling, which can fail in multi-server setups.
+4. Use NestJS: better structuring of controllers, services.

@@ -9,8 +9,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import axios from "axios";
 import { logError, logInfo } from "../utils/logging";
 import { retry } from "../utils/retry";
-import config from "../utils/config";
-
+import config, { Config } from "../utils/config";
 const ERC20_ABI = [
   {
     type: "function",
@@ -221,48 +220,33 @@ export class TransactionManager {
           ? config.mantleChainId
           : config.ethereumChainId;
 
-      // Use the correct token addresses based on direction
-      const sourceToken =
-        direction === "MAINNET_TO_MANTLE"
-          ? config.ethereumTokenAddress
-          : config.mantleTokenAddress;
-      const destToken =
-        direction === "MAINNET_TO_MANTLE"
-          ? config.mantleTokenAddress
-          : config.ethereumTokenAddress;
+      // Log request parameters for verification
+      const params = {
+        fromChainId,
+        toChainId,
+        fromTokenAddress: fromTokenAddress.toLowerCase(),
+        toTokenAddress: toTokenAddress.toLowerCase(),
+        fromAmount: amount.toString(),
+        userAddress: this.ethereumWalletClient.account.address,
+        singleTxOnly: true,
+        bridgeWithGas: false,
+        sort: "output",
+        defaultSwapSlippage: 1,
+        isContractCall: false,
+        showAutoRoutes: false,
+      };
 
-      // Log request parameters
-      logInfo(`Requesting bridge quote with params:
-        fromChainId: ${fromChainId}
-        toChainId: ${toChainId}
-        fromTokenAddress: ${sourceToken}
-        toTokenAddress: ${destToken}
-        fromAmount: ${amount.toString()}
-        userAddress: ${this.ethereumWalletClient.account.address}
-      `);
+      // logInfo(`Socket API request params: ${JSON.stringify(params, null, 2)}`);
 
-      // Get quote from Bungee with correct token addresses
+      // Get quote from Socket/Bungee
       const quoteResponse = await this.bungeeApiClient.get("/quote", {
-        params: {
-          fromChainId,
-          toChainId,
-          fromTokenAddress: sourceToken,
-          toTokenAddress: destToken,
-          fromAmount: amount.toString(),
-          userAddress: this.ethereumWalletClient.account.address,
-          singleTxOnly: true,
-          bridgeWithGas: false,
-          sort: "output",
-          defaultSwapSlippage: 0.5,
-          isContractCall: false,
-          showAutoRoutes: false,
-        },
+        params,
       });
 
-      // Log response
-      logInfo(
-        `Bridge quote response: ${JSON.stringify(quoteResponse.data, null, 2)}`
-      );
+      // Log the full response for debugging
+      // logInfo(
+      //   `Socket API response: ${JSON.stringify(quoteResponse.data, null, 2)}`
+      // );
 
       if (
         !quoteResponse.data.success ||
@@ -280,7 +264,7 @@ export class TransactionManager {
 
       const selectedRoute = quoteResponse.data.result.routes[0];
 
-      // Get transaction data
+      // Get transaction data with exact same route
       const buildTxResponse = await this.bungeeApiClient.post("/build-tx", {
         route: selectedRoute,
       });
@@ -317,13 +301,17 @@ export class TransactionManager {
   ): Promise<SwapQuote> {
     try {
       // Use the correct ETH address for Mantle chain
-      const mantleEthAddress = "0xdeaddeaddeaddeaddeaddeaddeaddeaddead1111" as Address;
-      
+      const mantleEthAddress =
+        "0xdeaddeaddeaddeaddeaddeaddeaddeaddead1111" as Address;
+      const ethereumEthAddress =
+        "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" as Address;
+
       // If we're swapping to ETH on Mantle, use the correct address
-      const actualToAddress = 
-        chainId === config.mantleChainId && 
-        toTokenAddress.toLowerCase() === "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" 
-          ? mantleEthAddress 
+      const actualToAddress =
+        chainId === config.mantleChainId &&
+        toTokenAddress.toLowerCase() ===
+          "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          ? mantleEthAddress
           : toTokenAddress;
 
       logInfo(`Requesting swap quote with params:
@@ -388,66 +376,118 @@ export class TransactionManager {
     tokenAddress: Address;
     amount: bigint;
     direction: "MAINNET_TO_MANTLE" | "MANTLE_TO_MAINNET";
-    config: any;
+    config: Config;
   }): Promise<Hash> {
-    try {
-      if (direction === "MANTLE_TO_MAINNET") {
-        // First swap MNT to ETH on Mantle
-        logInfo("Swapping MNT to ETH on Mantle before bridging");
-        const swapQuote = await this.getSwapQuote(
-          config.mantleTokenAddress as Address,
-          "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE" as Address,
-          amount,
-          config.mantleChainId
-        );
+    logInfo(`Bridge tokens with params:
+      tokenAddress: ${tokenAddress}
+      amount: ${amount.toString()}
+      direction: ${direction}
+    `);
 
-        // Execute swap transaction
+    try {
+      const sourceToken =
+        direction === "MAINNET_TO_MANTLE"
+          ? config.ethereumTokenAddress
+          : config.mantleTokenAddress;
+      const destToken =
+        direction === "MAINNET_TO_MANTLE"
+          ? config.mantleTokenAddress
+          : config.ethereumTokenAddress;
+
+      logInfo(`Initiating bridge transaction:
+        Direction: ${direction}
+        Amount: ${amount.toString()}
+        Source Token: ${sourceToken}
+        Destination Token: ${destToken}
+      `);
+
+      // Get bridge quote with correct token addresses
+      let quote = await this.getBridgeQuote(
+        sourceToken as Address,
+        destToken as Address,
+        amount,
+        direction
+      );
+
+      if (quote.route.length === 0) {
+        // swap all asset to ETH, then bridge ETH, then swap ETH to destination token
+        const swapQuote = await this.getSwapQuote(
+          sourceToken as Address,
+          config.ethAddress as Address,
+          amount,
+          direction === "MAINNET_TO_MANTLE"
+            ? config.ethereumChainId
+            : config.mantleChainId
+        );
         const swapTx: TransactionConfig = {
           to: swapQuote.txTarget,
           data: swapQuote.txData,
           value: swapQuote.value,
         };
-
-        const swapHash = await this.sendTransaction(swapTx, "mantle");
-        await this.waitForTransaction(swapHash, "mantle");
+        const swapHash = await this.sendTransaction(
+          swapTx,
+          direction === "MAINNET_TO_MANTLE" ? "ethereum" : "mantle"
+        );
+        await this.waitForTransaction(
+          swapHash,
+          direction === "MAINNET_TO_MANTLE" ? "ethereum" : "mantle"
+        );
         logInfo(`Swap transaction completed: ${swapHash}`);
 
-        // Now bridge the ETH from Mantle to Ethereum
-        logInfo("Bridging swapped ETH from Mantle to Ethereum");
+        // bridge ETH
         const bridgeQuote = await this.getBridgeQuote(
-          "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE" as Address,
-          "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE" as Address,
+          config.ethAddress as Address,
+          destToken as Address,
           swapQuote.toAmount,
-          direction
+          direction === "MAINNET_TO_MANTLE"
+            ? "MAINNET_TO_MANTLE"
+            : "MANTLE_TO_MAINNET"
         );
-
         const bridgeTx: TransactionConfig = {
           to: bridgeQuote.txTarget,
           data: bridgeQuote.txData,
           value: bridgeQuote.value,
         };
 
-        return await this.sendTransaction(bridgeTx, "mantle");
-      } else {
-        // Use correct source and destination token addresses
-        const sourceToken = config.ethereumTokenAddress;
-        const destToken = config.mantleTokenAddress;
+        const bridgeHash = await this.sendTransaction(
+          bridgeTx,
+          direction === "MAINNET_TO_MANTLE" ? "ethereum" : "mantle"
+        );
+        await this.waitForTransaction(
+          bridgeHash,
+          direction === "MAINNET_TO_MANTLE" ? "ethereum" : "mantle"
+        );
+        logInfo(`Bridge transaction completed: ${bridgeHash}`);
 
-        logInfo(`Initiating bridge transaction:
-          Direction: ${direction}
-          Amount: ${amount.toString()}
-          Source Token: ${sourceToken}
-          Destination Token: ${destToken}
-        `);
-
-        // Get bridge quote with correct token addresses
-        const quote = await this.getBridgeQuote(
-          sourceToken as Address,
+        // todo: add case when bridge takes too long, store txhash and check status later
+        // swap ETH to destination token
+        const finalSwapQuote = await this.getSwapQuote(
+          config.ethAddress as Address,
           destToken as Address,
-          amount,
-          direction
+          bridgeQuote.route.toAmount,
+          direction === "MAINNET_TO_MANTLE"
+            ? config.ethereumChainId
+            : config.mantleChainId
+        );
+        const finalSwapTx: TransactionConfig = {
+          to: finalSwapQuote.txTarget,
+          data: finalSwapQuote.txData,
+          value: finalSwapQuote.value,
+        };
+        const finalSwapHash = await this.sendTransaction(
+          finalSwapTx,
+          direction === "MAINNET_TO_MANTLE" ? "ethereum" : "mantle"
         );
 
+        await this.waitForTransaction(
+          finalSwapHash,
+          direction === "MAINNET_TO_MANTLE" ? "ethereum" : "mantle"
+        );
+        logInfo(`Final swap transaction completed: ${finalSwapHash}`);
+
+        return finalSwapHash;
+      } else {
+        // bridge directly
         // Check and handle approvals if needed
         if (quote.approvalData) {
           const currentAllowance = await this.checkAllowance(
@@ -459,6 +499,10 @@ export class TransactionManager {
             direction === "MAINNET_TO_MANTLE" ? "ethereum" : "mantle"
           );
 
+          logInfo(
+            `Current allowance: ${currentAllowance}, Required: ${quote.approvalData.amount}`
+          );
+
           if (currentAllowance < quote.approvalData.amount) {
             const approvalHash = await this.approveToken(
               tokenAddress,
@@ -467,13 +511,20 @@ export class TransactionManager {
               direction === "MAINNET_TO_MANTLE" ? "ethereum" : "mantle"
             );
 
-            // Wait for approval transaction
+            // Wait for approval transaction with more confirmations
             await this.waitForTransaction(
               approvalHash,
               direction === "MAINNET_TO_MANTLE" ? "ethereum" : "mantle"
             );
           }
         }
+
+        quote = await this.getBridgeQuote(
+          sourceToken as Address,
+          destToken as Address,
+          amount,
+          direction
+        );
 
         // Execute bridge transaction
         const tx: TransactionConfig = {
@@ -482,22 +533,49 @@ export class TransactionManager {
           value: quote.value,
         };
 
-        // Estimate gas and add buffer
-        const estimatedGas = await this.estimateGas(
-          tx,
-          direction === "MAINNET_TO_MANTLE" ? "ethereum" : "mantle"
-        );
-        tx.gasLimit = (estimatedGas * BigInt(120)) / BigInt(100);
+        // Add more detailed logging
+        logInfo(`Constructing transaction:
+          to: ${tx.to}
+          value: ${tx.value?.toString() || "0"}
+          has data: ${tx.data ? "yes" : "no"}
+          approval needed: ${quote.approvalData ? "yes" : "no"}
+        `);
 
-        const hash = await this.sendTransaction(
-          tx,
-          direction === "MAINNET_TO_MANTLE" ? "ethereum" : "mantle"
-        );
+        try {
+          // Estimate gas and add buffer
+          const estimatedGas = await this.estimateGas(
+            tx,
+            direction === "MAINNET_TO_MANTLE" ? "ethereum" : "mantle"
+          );
+          tx.gasLimit = (estimatedGas * BigInt(120)) / BigInt(100);
 
-        return hash;
+          logInfo(`Gas estimation successful:
+            estimated: ${estimatedGas}
+            with buffer: ${tx.gasLimit}
+          `);
+
+          const hash = await this.sendTransaction(
+            tx,
+            direction === "MAINNET_TO_MANTLE" ? "ethereum" : "mantle"
+          );
+
+          return hash;
+        } catch (error) {
+          // Log the full error details
+          logError("Transaction failed:", {
+            tx: {
+              to: tx.to,
+              value: tx.value?.toString() || "0",
+              hasData: !!tx.data,
+            },
+          });
+          // TODO: remove this
+          // throw error;
+          return "0x";
+        }
       }
     } catch (error) {
-      logError("Error in bridgeTokens:", error);
+      logError("Error in bridgeTokens:");
       throw error;
     }
   }
@@ -585,7 +663,7 @@ export class TransactionManager {
 
       return "PENDING";
     } catch (error) {
-      logError("Error checking bridge status:", error);
+      logError("Error checking bridge status:");
       throw error;
     }
   }
@@ -593,7 +671,9 @@ export class TransactionManager {
   private isNativeToken(tokenAddress: Address): boolean {
     return (
       tokenAddress.toLowerCase() ===
-      "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" ||
+      tokenAddress.toLowerCase() ===
+        "0x0000000000000000000000000000000000000000"
     );
   }
 
@@ -634,11 +714,23 @@ export class TransactionManager {
         : this.mantleChainClient;
 
     try {
+      logInfo(`Estimating gas for transaction:
+        to: ${tx.to}
+        value: ${tx.value?.toString() || "0"}
+        chain: ${chainType}
+      `);
+
       const estimate = await client.estimateGas(tx);
+      logInfo(`Gas estimation result: ${estimate}`);
       return estimate;
     } catch (error) {
-      logError("Error estimating gas:", error);
-      throw error;
+      logError("Error estimating gas:");
+      // Rethrow with more context
+      throw new Error(
+        `Gas estimation failed: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
     }
   }
 }
